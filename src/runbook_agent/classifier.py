@@ -238,8 +238,9 @@ def _check_flags(prog: str, args: list[str], rule: Rule) -> None:
                 raise Unsafe(MUTATING, f"{prog} -{hit} can write or change state")
 
 
-def classify_argv(argv: list[str]) -> None:
+def classify_argv(argv: list[str], rules: dict[str, Rule] | None = None) -> None:
     """Raise ``Unsafe`` unless this single command is on the read-only allowlist."""
+    rules = RULES if rules is None else rules
     prog, args = argv[0], argv[1:]
     if _ENV_ASSIGN.match(prog):
         raise Unsafe(UNKNOWN, "sets environment variables for the command")
@@ -247,7 +248,7 @@ def classify_argv(argv: list[str]) -> None:
         raise Unsafe(MUTATING, "runs with elevated privileges (sudo)")
     if "/" in prog:
         raise Unsafe(UNKNOWN, f"{prog} is called by path, not a known command name")
-    rule = RULES.get(prog)
+    rule = rules.get(prog)
     if rule is None:
         raise Unsafe(UNKNOWN, f"{prog} is not on the read-only allowlist")
     _check_flags(prog, args, rule)
@@ -272,27 +273,27 @@ def classify_argv(argv: list[str]) -> None:
             raise Unsafe(UNKNOWN, "kubectl may print secret values")
 
 
-def parse_command(command: str) -> list[tuple[str | None, list[str]]]:
+def parse_command(command: str, rules: dict[str, Rule] | None = None) -> list[tuple[str | None, list[str]]]:
     """Lex and validate a command; return its segments or raise ``Unsafe``."""
     segments = split_segments(lex(command))
     if not segments:
         raise Unsafe(UNKNOWN, "empty command")
     for _, argv in segments:
-        classify_argv(argv)
+        classify_argv(argv, rules)
     return segments
 
 
-def classify(command: str) -> Verdict:
+def classify(command: str, rules: dict[str, Rule] | None = None) -> Verdict:
     try:
-        parse_command(command)
+        parse_command(command, rules)
     except Unsafe as exc:
         return Verdict(exc.kind, exc.reason)
     return Verdict(READ_ONLY, "only read-only commands, no shell features")
 
 
-def classify_step(commands: list[str]) -> Verdict:
+def classify_step(commands: list[str], rules: dict[str, Rule] | None = None) -> Verdict:
     """A step is read-only only if every one of its commands is."""
-    verdicts = [classify(c) for c in commands]
+    verdicts = [classify(c, rules) for c in commands]
     for kind in (MUTATING, UNKNOWN):
         for v in verdicts:
             if v.kind == kind:

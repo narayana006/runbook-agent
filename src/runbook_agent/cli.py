@@ -14,10 +14,12 @@ from .approvals import DEFAULT_TTL, ApprovalStore
 from .classifier import READ_ONLY, classify, classify_step
 from .executor import AuditLog, Executor, Outcome
 from .parser import Runbook, Step, parse_file
+from .rules import ConfigError, load_rules
 from .server import RunbookServer
 
 DEFAULT_LOG = "runbook-audit.jsonl"
 DEFAULT_STATE = ".runbook-agent"
+RULES_HELP = "JSON file of extra allowlist rules (see README); never loaded unless given"
 EXIT = {"dry-run": 0, "completed": 0, "failed": 1, "awaiting-approval": 3}
 
 
@@ -28,21 +30,29 @@ def _load(path: str) -> Runbook:
         raise SystemExit(f"runbook-agent: cannot read {path}: {exc.strerror}")
 
 
+def _rules(args) -> dict:
+    try:
+        return load_rules(args.rules)
+    except ConfigError as exc:
+        raise SystemExit(f"runbook-agent: bad rules file: {exc}")
+
+
 def cmd_parse(args) -> int:
     rb = _load(args.runbook)
+    rules = _rules(args)
     if args.json:
         steps = [
-            {**asdict(s), "classification": classify_step(s.commands).kind,
-             "commands": [{"command": c, **asdict(classify(c))} for c in s.commands]}
+            {**asdict(s), "classification": classify_step(s.commands, rules).kind,
+             "commands": [{"command": c, **asdict(classify(c, rules))} for c in s.commands]}
             for s in rb.steps
         ]
         print(json.dumps({"runbook": rb.name, "title": rb.title, "steps": steps}, indent=2))
         return 0
     print(f"{rb.title} ({rb.name}): {len(rb.steps)} steps")
     for s in rb.steps:
-        print(f"\n[{s.number}] {s.title}  ({classify_step(s.commands).kind}, line {s.line})")
+        print(f"\n[{s.number}] {s.title}  ({classify_step(s.commands, rules).kind}, line {s.line})")
         for c in s.commands:
-            v = classify(c)
+            v = classify(c, rules)
             for i, line in enumerate(c.splitlines()):
                 print(f"    {'$' if i == 0 else ' '} {line}")
             print(f"      -> {v.kind}: {v.reason}")
@@ -69,6 +79,7 @@ def _print_outcome(o: Outcome, first: bool) -> None:
 
 def cmd_run(args) -> int:
     rb = _load(args.runbook)
+    rules = _rules(args)
     approved = set(args.approve or [])
     unknown = approved - {s.number for s in rb.steps}
     if unknown:
@@ -86,7 +97,8 @@ def cmd_run(args) -> int:
         return None
 
     log = args.log or (DEFAULT_LOG if args.execute else None)
-    executor = Executor(rb, execute=args.execute, approver=approver, audit=AuditLog(log), timeout=args.timeout)
+    executor = Executor(rb, execute=args.execute, approver=approver, audit=AuditLog(log), timeout=args.timeout,
+                        rules=rules)
     mode = "EXECUTE" if args.execute else "DRY RUN (nothing is executed; pass --execute to run)"
     print(f"{rb.title} ({rb.name}): {len(rb.steps)} steps, mode: {mode}")
     outcomes, status = executor.run()
@@ -125,9 +137,10 @@ def cmd_serve(args) -> int:
     directory = Path(args.directory)
     if not directory.is_dir():
         raise SystemExit(f"runbook-agent: not a directory: {directory}")
+    rules = _rules(args)
     log = args.log or (DEFAULT_LOG if args.execute else None)
     server = RunbookServer(directory, execute=args.execute, store=ApprovalStore(args.state_dir),
-                           audit=AuditLog(log), timeout=args.timeout)
+                           audit=AuditLog(log), timeout=args.timeout, rules=rules)
     mode = "execute" if args.execute else "dry-run"
     print(f"runbook-agent MCP server on stdio: {directory} ({mode} mode)", file=sys.stderr)
     server.serve()
@@ -142,6 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("parse", help="show a runbook's steps and how each command is classified")
     sp.add_argument("runbook")
     sp.add_argument("--json", action="store_true", help="machine-readable output")
+    sp.add_argument("--rules", metavar="FILE", help=RULES_HELP)
     sp.set_defaults(func=cmd_parse)
 
     sp = sub.add_parser("run", help="walk a runbook; dry-run unless --execute is given")
@@ -153,6 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--approver", default=getpass.getuser(), help="name recorded in the audit log")
     sp.add_argument("--log", help=f"audit log path (default with --execute: {DEFAULT_LOG})")
     sp.add_argument("--timeout", type=float, default=30.0, help="seconds per command (default 30)")
+    sp.add_argument("--rules", metavar="FILE", help=RULES_HELP)
     sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser("approve", help="record a one-time approval of a step for the MCP server")
@@ -170,6 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--log", help=f"audit log path (default with --execute: {DEFAULT_LOG})")
     sp.add_argument("--state-dir", default=DEFAULT_STATE)
     sp.add_argument("--timeout", type=float, default=30.0)
+    sp.add_argument("--rules", metavar="FILE", help=RULES_HELP)
     sp.set_defaults(func=cmd_serve)
     return p
 

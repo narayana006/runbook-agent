@@ -23,14 +23,14 @@ class Result:
     output: str
 
 
-def run_readonly(command: str, timeout: float = 30.0) -> Result:
+def run_readonly(command: str, timeout: float = 30.0, rules: dict | None = None) -> Result:
     """Run a read-only command without a shell.
 
     The command is re-validated here, so nothing reaches ``subprocess`` unless
     it passes the allowlist. Pipes and ``&&``/``||``/``;`` are handled directly.
     """
     try:
-        segments = parse_command(command)
+        segments = parse_command(command, rules)
     except Unsafe as exc:
         raise PermissionError(f"refusing to auto-run: {exc.reason}") from exc
     pipelines: list[tuple[str | None, list[list[str]]]] = []
@@ -141,20 +141,22 @@ class Executor:
         approver: Approver = deny_all,
         audit: AuditLog | None = None,
         timeout: float = 30.0,
-        readonly_runner: Callable[[str, float], Result] = run_readonly,
+        readonly_runner: Callable[[str, float], Result] | None = None,
         shell_runner: Callable[[str, float], Result] = run_shell,
+        rules: dict | None = None,
     ):
         self.runbook = runbook
         self.execute = execute
         self.approver = approver
         self.audit = audit or AuditLog(None)
         self.timeout = timeout
-        self._readonly_runner = readonly_runner
+        self.rules = rules
+        self._readonly_runner = readonly_runner or (lambda c, t: run_readonly(c, t, rules=rules))
         self._shell_runner = shell_runner
 
     def run_step(self, step: Step) -> tuple[list[Outcome], bool]:
         """Run one step. Returns its outcomes and whether the run may continue."""
-        verdicts = [classify(c) for c in step.commands]
+        verdicts = [classify(c, self.rules) for c in step.commands]
         gated = any(v.needs_approval for v in verdicts)
         approved_by = None
         if self.execute and gated:

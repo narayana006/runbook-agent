@@ -1,0 +1,16 @@
+{
+  "allow": {
+    "gcloud": {
+      "subcommands": ["compute instances list", "compute instances describe", "config list", "container clusters list"],
+      "deny_long": ["--log-http"],
+      "value_flags": ["--project", "--zone", "--region", "--format"]
+    },
+    "kubectl": {
+      "subcommands": ["get-contexts"]
+    },
+    "uname": {
+      "deny_short": "n"
+    }
+  },
+  "deny": ["ping"]
+}

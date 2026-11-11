@@ -54,13 +54,15 @@ class ToolError(Exception):
 
 class RunbookServer:
     def __init__(self, directory: str | Path, *, execute: bool = False, store: ApprovalStore | None = None,
-                 audit: AuditLog | None = None, timeout: float = 30.0, executor_factory=Executor):
+                 audit: AuditLog | None = None, timeout: float = 30.0, executor_factory=Executor,
+                 rules: dict | None = None):
         self.directory = Path(directory).resolve()
         self.execute = execute
         self.store = store
         self.audit = audit or AuditLog(None)
         self.timeout = timeout
         self._executor_factory = executor_factory
+        self.rules = rules
 
     # -- tools ---------------------------------------------------------
     def _load(self, name: str) -> Runbook:
@@ -73,7 +75,7 @@ class RunbookServer:
         out = []
         for path in sorted(self.directory.glob("*.md")):
             rb = parse_file(path)
-            gated = sum(classify_step(s.commands).needs_approval for s in rb.steps)
+            gated = sum(classify_step(s.commands, self.rules).needs_approval for s in rb.steps)
             out.append({"runbook": rb.name, "title": rb.title, "steps": len(rb.steps),
                         "steps_needing_approval": gated})
         return out
@@ -82,11 +84,11 @@ class RunbookServer:
         rb = self._load(args.get("runbook", ""))
         steps = []
         for s in rb.steps:
-            v = classify_step(s.commands)
+            v = classify_step(s.commands, self.rules)
             steps.append({
                 "step": s.number, "title": s.title, "section": s.section,
                 "classification": v.kind, "needs_approval": v.needs_approval,
-                "commands": [{"command": c, **asdict(classify(c))} for c in s.commands],
+                "commands": [{"command": c, **asdict(classify(c, self.rules))} for c in s.commands],
             })
         return {"runbook": rb.name, "title": rb.title, "steps": steps}
 
@@ -100,7 +102,7 @@ class RunbookServer:
             return self.store.consume(s.fingerprint(rb.name)) if self.store else None
 
         executor = self._executor_factory(rb, execute=self.execute, approver=approver,
-                                          audit=self.audit, timeout=self.timeout)
+                                          audit=self.audit, timeout=self.timeout, rules=self.rules)
         outcomes, _ = executor.run_step(step)
         actions = {o.action for o in outcomes}
         result = {"runbook": rb.name, "step": step.number, "title": step.title,

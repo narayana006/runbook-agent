@@ -2,7 +2,7 @@
 
 Turn Markdown runbooks into executable steps: read-only diagnostics run automatically, anything that changes state waits for a human to approve that exact step. Works as a command-line tool and as an MCP server.
 
-**Status: first working version (0.1.0).** Parsing, command classification, dry-run, approval-gated execution, the audit log and a stdio MCP server all work today. The classifier is a fixed allowlist that cannot yet be extended from a config file; see [Limitations](#limitations).
+**Status: first working version (0.1.0).** Parsing, command classification, dry-run, approval-gated execution, the audit log, a stdio MCP server and user-defined allowlist rules (`--rules FILE`) all work today. See [Limitations](#limitations) for what does not.
 
 ## Safety model
 
@@ -145,6 +145,8 @@ The matching audit log entry for step 3:
 | `runbook-agent approve FILE N` | Record a one-time approval of step `N` for the MCP server (prompts for `yes`; `--yes` skips the prompt). |
 | `runbook-agent serve DIR [--execute]` | Serve the `*.md` runbooks in `DIR` as an MCP server over stdio. |
 
+`parse`, `run` and `serve` also take `--rules FILE` to load [extra allowlist rules](#custom-allowlist-rules).
+
 Other options: `--log PATH` (audit log; defaults to `runbook-audit.jsonl` when `--execute` is given, no log is written for a dry run unless you ask), `--timeout SECONDS` per command (default 30), `--approver NAME` (recorded in the log, defaults to the current user), `--state-dir DIR` (where approvals are stored, default `.runbook-agent`).
 
 Exit codes for `run`: `0` dry-run finished or runbook completed, `1` an approved change failed, `3` stopped waiting for approval.
@@ -154,6 +156,56 @@ Exit codes for `run`: `0` dry-run finished or runbook completed, `1` an approved
 Three labels: `read-only` runs automatically; `mutating` (recognised as changing state) and `unknown` (not recognised, or needs a shell) both wait for approval.
 
 Read-only today: common inspection commands (`cat`, `ls`, `grep`, `head`, `tail`, `df`, `du`, `ps`, `dig`, `ping`, `jq`, `stat`, ...), `find` without `-delete`/`-exec`, `sort` without `-o`, `journalctl` without maintenance flags, `curl` for plain GET/HEAD with no upload or output-file flags, and the read subcommands of `kubectl` (`get`, `describe`, `logs`, `top`, `rollout status`, ...), `git`, `docker`, `systemctl`, `helm` and `aws` (`describe-*`, `list-*`, `get-*`, `s3 ls`). Commands that would print secrets (`kubectl get secret`, `aws ... get-secret-value`) need approval. Pipes and `&&`, `||`, `;` between read-only commands are allowed. The full table is in [`src/runbook_agent/classifier.py`](src/runbook_agent/classifier.py).
+
+### Custom allowlist rules
+
+Pass a JSON file with `--rules` to teach the classifier about your own read-only tools, or to make it stricter. The file is only read when you name it; nothing is picked up automatically from the current directory, so a rules file inside a cloned repository cannot loosen the checks on its own. [`examples/rules.json`](examples/rules.json):
+
+```json
+{
+  "allow": {
+    "gcloud": {
+      "subcommands": ["compute instances list", "compute instances describe", "config list", "container clusters list"],
+      "deny_long": ["--log-http"],
+      "value_flags": ["--project", "--zone", "--region", "--format"]
+    },
+    "kubectl": { "subcommands": ["get-contexts"] },
+    "uname": { "deny_short": "n" }
+  },
+  "deny": ["ping"]
+}
+```
+
+```console
+$ runbook-agent parse examples/runbooks/gcp-vm.md --rules examples/rules.json
+GCE VM is unreachable (gcp-vm.md): 4 steps
+
+[1] Check which project the CLI is pointed at.  (read-only, line 5)
+    $ gcloud config list
+      -> read-only: only read-only commands, no shell features
+
+[2] List instances in the zone.  (read-only, line 11)
+    $ gcloud --project shop-prod compute instances list --zone europe-west1-b
+      -> read-only: only read-only commands, no shell features
+
+[3] Check the VM answers on the network.  (unknown, line 17)
+    $ ping -c 3 10.0.0.12
+      -> unknown: ping is not on the read-only allowlist
+
+[4] Reset the VM.  (mutating, line 23)
+    $ gcloud --project shop-prod compute instances reset web-1 --zone europe-west1-b
+      -> mutating: gcloud compute instances is not a read-only subcommand
+```
+
+Without `--rules`, steps 1, 2 and 4 are all `unknown` (gcloud is not built in) and step 3 is read-only.
+
+How the file is applied:
+
+- **`allow`** maps a program name to a rule. Fields: `subcommands` (allowed subcommand prefixes such as `"compute instances list"`; leave it out to allow any arguments), `deny_short` (single-letter flags that write, e.g. `"of"`), `deny_long` (long flags that write; `"--out"` also blocks `--out=x` and `--output`), `value_flags` (global flags that take a value, skipped when finding the subcommand), `max_positional`, `prefixes` and `skip_words` (operation-word matching, as the built-in `aws` rule uses).
+- **A new program** gets exactly the rule you write.
+- **A built-in program** can only be extended: listed `subcommands`, `deny_short`, `deny_long` and `value_flags` are added to the built-in ones, and the built-in restrictions (secret checks, write flags) stay. `prefixes`, `max_positional` and `skip_words` cannot be changed for built-ins, and adding `subcommands` to a built-in that already allows any arguments (such as `cat`) is rejected.
+- **`deny`** removes programs from the allowlist, so they wait for approval.
+- **Refused outright:** names that are paths or contain shell characters, and programs that run other commands (`sh`, `bash`, `env`, `xargs`, `sudo`, `timeout`, `watch`, `python`, `awk`, `sed`, `ssh`, ...). Unknown fields, wrong types and a program listed in both `allow` and `deny` are errors too. A bad file stops the tool (exit 1) with a message naming the problem; it never falls back to the built-in rules silently.
 
 ## MCP server
 
@@ -183,14 +235,15 @@ To register it with an MCP client, point the client at the command `runbook-agen
 - [x] Auto-run diagnostics, require approval for changes (dry-run by default)
 - [x] Full audit log of what ran and why (JSON Lines)
 - [x] MCP server so any agent client can use it (stdio transport, tools only)
-- [ ] User-defined allowlist rules from a config file
+- [x] User-defined allowlist rules from a JSON config file (`--rules`)
 - [ ] Redaction of secrets in captured output
 - [ ] Variables and parameters passed into runbook steps
 - [ ] HTTP transport for the MCP server
 
 ## Limitations
 
-- The allowlist is built in. A read-only command it does not know (for example `gcloud ... list`) is treated as needing approval; there is no config file to extend it yet.
+- A read-only command the built-in allowlist does not know (for example `gcloud ... list`) needs approval unless you add it with `--rules`. Rules files are JSON only (no YAML or TOML), and there is no way to set a default rules file other than passing `--rules` every time.
+- A rule you add is trusted as written. If you allow a subcommand that can write, or a program whose flags can run other commands, it will be auto-run.
 - "Read-only" means "does not change state", not "harmless to disclose". `cat` will happily print a sensitive file, and captured output (first 4000 characters per command) is written to the audit log unredacted.
 - A GET request can still trigger side effects on a badly designed endpoint. `curl` GETs are treated as read-only.
 - Commands are found through `PATH`. If `PATH` contains a hostile `df`, it will be run.
