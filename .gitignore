@@ -8,3 +8,8 @@ build/
 *.egg-info/
 .pytest_cache/
 .DS_Store
+
+# runbook-agent runtime files
+.runbook-agent/
+runbook-audit.jsonl
+runbook-agent-demo.txt
