@@ -2,7 +2,7 @@
 
 Turn Markdown runbooks into executable steps: read-only diagnostics run automatically, anything that changes state waits for a human to approve that exact step. Works as a command-line tool and as an MCP server.
 
-**Status: first working version (0.1.0).** Parsing, command classification, dry-run, approval-gated execution, the audit log, a stdio MCP server and user-defined allowlist rules (`--rules FILE`) all work today. See [Limitations](#limitations) for what does not.
+**Status: first working version (0.1.0).** Parsing, command classification, dry-run, approval-gated execution, the audit log, redaction of secrets in captured output, a stdio MCP server and user-defined allowlist rules (`--rules FILE`) all work today. See [Limitations](#limitations) for what does not.
 
 ## Safety model
 
@@ -14,6 +14,7 @@ The tool is built so that the dangerous path is the one that takes effort.
 - **Approval is per step and explicit.** A mutating step runs only when a human names it (`--approve 3`), types `yes` at an interactive prompt, or records a one-time approval for the MCP server. A blocked or failed change stops the runbook.
 - **The agent cannot approve itself.** The MCP server has no approval tool. Approvals are recorded out of band, are single-use, expire after 15 minutes and are bound to the exact command text, so editing the step voids them.
 - **Everything is logged.** Each command, its classification, the reason, who approved it, exit code and output go to a JSON Lines audit log.
+- **Secrets are masked in output.** Captured output is redacted before it is printed, written to the audit log or returned to an MCP client. See [Redaction](#redaction).
 
 ## Install
 
@@ -125,7 +126,7 @@ Result: completed. 4 command(s) executed, 1 step(s) need approval, audit log: ru
 The matching audit log entry for step 3:
 
 ```json
-{"ts": "2026-11-11T02:00:36+00:00", "runbook": "hello.md", "step": 3, "title": "Write a marker file (redirection writes to disk, so this needs approval).", "command": "echo \"runbook-agent was here\" > runbook-agent-demo.txt", "classification": "mutating", "reason": "redirects output to a file", "action": "approved-run", "approved_by": "dana", "exit_code": 0, "duration_ms": 57, "output": ""}
+{"ts": "2026-11-11T02:00:36+00:00", "runbook": "hello.md", "step": 3, "title": "Write a marker file (redirection writes to disk, so this needs approval).", "command": "echo \"runbook-agent was here\" > runbook-agent-demo.txt", "classification": "mutating", "reason": "redirects output to a file", "action": "approved-run", "approved_by": "dana", "exit_code": 0, "duration_ms": 57, "output": "", "redacted": 0}
 ```
 
 ## How runbooks are read
@@ -207,6 +208,39 @@ How the file is applied:
 - **`deny`** removes programs from the allowlist, so they wait for approval.
 - **Refused outright:** names that are paths or contain shell characters, and programs that run other commands (`sh`, `bash`, `env`, `xargs`, `sudo`, `timeout`, `watch`, `python`, `awk`, `sed`, `ssh`, ...). Unknown fields, wrong types and a program listed in both `allow` and `deny` are errors too. A bad file stops the tool (exit 1) with a message naming the problem; it never falls back to the built-in rules silently.
 
+## Redaction
+
+Every command's output (stdout and stderr) is passed through a redactor before it is shown, logged or returned. It is always on. Known token formats are replaced with a labelled mask, and the surrounding text is kept so the output stays readable:
+
+| Label | Matches |
+| --- | --- |
+| `private-key` | PEM `-----BEGIN ... PRIVATE KEY-----` blocks, including ones cut off mid-block |
+| `aws-access-key-id` | `AKIA...`, `ASIA...` style key IDs |
+| `github-token`, `gitlab-token`, `slack-token` | `ghp_...`, `github_pat_...`, `glpat-...`, `xoxb-...` |
+| `google-api-key`, `stripe-key`, `api-key` | `AIza...`, `sk_live_...`/`sk_test_...`, `sk-...` |
+| `jwt` | three-part `eyJ...` tokens |
+| `auth-header` | the value after `Authorization:` (the `Bearer`/`Basic` scheme is kept) |
+| `url-password` | the password in `scheme://user:password@host` |
+| `secret-value` | the value assigned with `=` or `:` to a name containing `password`, `secret`, `token`, `api_key`, `access_key`, `private_key`, `client_secret` or `credential` (quoted JSON/YAML values too) |
+
+A runbook step that runs `cat app.env` on a file holding a password and an AWS key:
+
+```console
+$ runbook-agent run config.md --execute --log audit.jsonl
+Check app config (config.md): 1 steps, mode: EXECUTE
+
+[1] Show the environment file.
+    $ cat app.env
+      auto-run: exit 0 in 5 ms, 2 secret(s) redacted
+      | DB_HOST=db.internal
+      | DB_PASSWORD=[REDACTED:secret-value]
+      | AWS_ACCESS_KEY_ID=[REDACTED:aws-access-key-id]
+
+Result: completed. 1 command(s) executed, 0 step(s) need approval, audit log: audit.jsonl.
+```
+
+The audit log entry stores the same masked output plus `"redacted": 2`, and MCP `run_step` results carry the same count. Redaction runs before output is cut to 4000 characters, so a secret that straddles the cut is never partly shown.
+
 ## MCP server
 
 ```bash
@@ -236,7 +270,7 @@ To register it with an MCP client, point the client at the command `runbook-agen
 - [x] Full audit log of what ran and why (JSON Lines)
 - [x] MCP server so any agent client can use it (stdio transport, tools only)
 - [x] User-defined allowlist rules from a JSON config file (`--rules`)
-- [ ] Redaction of secrets in captured output
+- [x] Redaction of secrets in captured output (pattern based, always on)
 - [ ] Variables and parameters passed into runbook steps
 - [ ] HTTP transport for the MCP server
 
@@ -244,7 +278,7 @@ To register it with an MCP client, point the client at the command `runbook-agen
 
 - A read-only command the built-in allowlist does not know (for example `gcloud ... list`) needs approval unless you add it with `--rules`. Rules files are JSON only (no YAML or TOML), and there is no way to set a default rules file other than passing `--rules` every time.
 - A rule you add is trusted as written. If you allow a subcommand that can write, or a program whose flags can run other commands, it will be auto-run.
-- "Read-only" means "does not change state", not "harmless to disclose". `cat` will happily print a sensitive file, and captured output (first 4000 characters per command) is written to the audit log unredacted.
+- "Read-only" means "does not change state", not "harmless to disclose". `cat` will happily print a sensitive file. Redaction is pattern based: it catches the formats listed under [Redaction](#redaction) but not a secret that looks like ordinary text, such as a bare password on its own line, a value passed as `--password xyz`, or the base64 `data:` values of a Kubernetes Secret. Command text itself is logged as written and is not redacted.
 - A GET request can still trigger side effects on a badly designed endpoint. `curl` GETs are treated as read-only.
 - Commands are found through `PATH`. If `PATH` contains a hostile `df`, it will be run.
 - Because auto-run commands do not go through a shell, diagnostics that use variables, globs or `2>&1` are classified `unknown` and wait for approval even when they are harmless.

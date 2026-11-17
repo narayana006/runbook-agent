@@ -13,6 +13,7 @@ from typing import Callable
 
 from .classifier import READ_ONLY, Unsafe, classify, parse_command
 from .parser import Runbook, Step
+from .redact import redact
 
 MAX_OUTPUT = 4000
 
@@ -122,6 +123,7 @@ class Outcome:
     exit_code: int | None = None
     duration_ms: int | None = None
     output: str | None = None
+    redacted: int = 0  # secrets masked in the output
 
 
 # An approver is asked once per mutating step and returns the approver's name, or None.
@@ -176,7 +178,9 @@ class Executor:
                     result = runner(command, self.timeout)
                     out.duration_ms = int((time.monotonic() - started) * 1000)
                     out.exit_code = result.exit_code
-                    out.output = result.output[:MAX_OUTPUT]
+                    # Redact before truncating so a cut can never expose part of a secret.
+                    output, out.redacted = redact(result.output)
+                    out.output = output[:MAX_OUTPUT]
                     if gated and result.exit_code != 0:
                         proceed = False  # a failed change stops the runbook
             self.audit.write(runbook=self.runbook.name, **asdict(out))

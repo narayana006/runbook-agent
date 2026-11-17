@@ -72,7 +72,8 @@ def _print_outcome(o: Outcome, first: bool) -> None:
         print(f"      BLOCKED: {o.classification}, not approved ({o.reason})")
     else:
         who = f" approved by {o.approved_by}" if o.action == "approved-run" else ""
-        print(f"      {o.action}{who}: exit {o.exit_code} in {o.duration_ms} ms")
+        masked = f", {o.redacted} secret(s) redacted" if o.redacted else ""
+        print(f"      {o.action}{who}: exit {o.exit_code} in {o.duration_ms} ms{masked}")
         for line in (o.output or "").rstrip().splitlines():
             print(f"      | {line}")
 
