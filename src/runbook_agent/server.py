@@ -17,11 +17,15 @@ from . import __version__
 from .approvals import ApprovalStore
 from .classifier import classify, classify_step
 from .executor import AuditLog, Executor
-from .parser import Runbook, parse_file
+from .parser import ParamError, Runbook, check_value, parse_file
 
 PROTOCOL_VERSION = "2024-11-05"
 
 _RUNBOOK_ARG = {"runbook": {"type": "string", "description": "Runbook file name, e.g. disk-full.md"}}
+_PARAMS_ARG = {"params": {
+    "type": "object", "additionalProperties": {"type": "string"},
+    "description": "Values for {{name}} placeholders in the runbook (see 'parameters' from get_runbook).",
+}}
 TOOLS = [
     {
         "name": "list_runbooks",
@@ -31,7 +35,7 @@ TOOLS = [
     {
         "name": "get_runbook",
         "description": "Return a runbook's steps, commands and read-only/mutating classification.",
-        "inputSchema": {"type": "object", "properties": _RUNBOOK_ARG, "required": ["runbook"]},
+        "inputSchema": {"type": "object", "properties": {**_RUNBOOK_ARG, **_PARAMS_ARG}, "required": ["runbook"]},
     },
     {
         "name": "run_step",
@@ -41,7 +45,8 @@ TOOLS = [
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {**_RUNBOOK_ARG, "step": {"type": "integer", "description": "Step number"}},
+            "properties": {**_RUNBOOK_ARG, **_PARAMS_ARG,
+                           "step": {"type": "integer", "description": "Step number"}},
             "required": ["runbook", "step"],
         },
     },
@@ -65,11 +70,21 @@ class RunbookServer:
         self.rules = rules
 
     # -- tools ---------------------------------------------------------
-    def _load(self, name: str) -> Runbook:
+    def _load(self, name: str, params: dict | None = None) -> Runbook:
         path = (self.directory / str(name)).resolve()
         if path.parent != self.directory or path.suffix != ".md" or not path.is_file():
             raise ToolError(f"unknown runbook: {name}")
-        return parse_file(path)
+        if params is not None and (not isinstance(params, dict)
+                                   or not all(isinstance(v, str) for v in params.values())):
+            raise ToolError("params must be an object of string values")
+        try:
+            rb = parse_file(path, params)
+        except ParamError as exc:
+            raise ToolError(str(exc))
+        unused = sorted(set(params or {}) - set(rb.parameters))
+        if unused:
+            raise ToolError(f"{rb.name} has no parameter(s): {', '.join(unused)}")
+        return rb
 
     def list_runbooks(self, _args: dict) -> list[dict]:
         out = []
@@ -81,7 +96,7 @@ class RunbookServer:
         return out
 
     def get_runbook(self, args: dict) -> dict:
-        rb = self._load(args.get("runbook", ""))
+        rb = self._load(args.get("runbook", ""), args.get("params") or None)
         steps = []
         for s in rb.steps:
             v = classify_step(s.commands, self.rules)
@@ -90,10 +105,10 @@ class RunbookServer:
                 "classification": v.kind, "needs_approval": v.needs_approval,
                 "commands": [{"command": c, **asdict(classify(c, self.rules))} for c in s.commands],
             })
-        return {"runbook": rb.name, "title": rb.title, "steps": steps}
+        return {"runbook": rb.name, "title": rb.title, "parameters": rb.parameters, "steps": steps}
 
     def run_step(self, args: dict) -> dict:
-        rb = self._load(args.get("runbook", ""))
+        rb = self._load(args.get("runbook", ""), args.get("params") or {})
         step = next((s for s in rb.steps if s.number == args.get("step")), None)
         if step is None:
             raise ToolError(f"{rb.name} has no step {args.get('step')!r}")
@@ -111,11 +126,15 @@ class RunbookServer:
         if result["status"] == "blocked":
             result["message"] = (
                 "This step changes state and has not been approved. Ask a human to run: "
-                f"runbook-agent approve {self.directory / rb.name} {step.number}"
+                f"runbook-agent approve {self.directory / rb.name} {step.number}{self._param_flags(args)}"
             )
         elif result["status"] == "dry-run":
             result["message"] = "Server is in dry-run mode (started without --execute); nothing was run."
         return result
+
+    @staticmethod
+    def _param_flags(args: dict) -> str:
+        return "".join(f" --param {k}={v}" for k, v in (args.get("params") or {}).items())
 
     # -- protocol ------------------------------------------------------
     def handle(self, msg: dict) -> dict | None:

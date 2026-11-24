@@ -23,3 +23,5 @@ jobs:
         run: runbook-agent run examples/runbooks/disk-full.md
       - name: Classify with custom rules
         run: runbook-agent parse examples/runbooks/gcp-vm.md --rules examples/rules.json
+      - name: Dry-run a parameterised runbook
+        run: runbook-agent run examples/runbooks/restart-service.md --param namespace=shop --param deployment=api

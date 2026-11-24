@@ -2,7 +2,7 @@
 
 Turn Markdown runbooks into executable steps: read-only diagnostics run automatically, anything that changes state waits for a human to approve that exact step. Works as a command-line tool and as an MCP server.
 
-**Status: first working version (0.1.0).** Parsing, command classification, dry-run, approval-gated execution, the audit log, redaction of secrets in captured output, a stdio MCP server and user-defined allowlist rules (`--rules FILE`) all work today. See [Limitations](#limitations) for what does not.
+**Status: first working version (0.1.0).** Parsing, command classification, dry-run, approval-gated execution, the audit log, redaction of secrets in captured output, a stdio MCP server and user-defined allowlist rules (`--rules FILE`) and runbook parameters (`--param NAME=VALUE`) all work today. See [Limitations](#limitations) for what does not.
 
 ## Safety model
 
@@ -136,6 +136,35 @@ The matching audit log entry for step 3:
 - Each line of a block is one command. Comment lines are dropped and trailing-backslash continuations are joined. In `console` blocks only `$ ` lines are commands.
 - A block containing a heredoc or shell control flow (`for`, `if`, `while`, ...) is kept whole as one script, which always needs approval.
 
+## Parameters
+
+A runbook can be reusable across services by putting `{{name}}` (required) or `{{name=default}}` placeholders inside its shell blocks. [`examples/runbooks/restart-service.md`](examples/runbooks/restart-service.md) uses `{{deployment}}`, `{{namespace}}` and `{{lines=20}}`:
+
+```console
+$ runbook-agent run examples/runbooks/restart-service.md --param namespace=shop --param deployment=checkout-api
+Restart a service (restart-service.md): 3 steps, mode: DRY RUN (nothing is executed; pass --execute to run)
+
+[1] Check the deployment.
+    $ kubectl get deploy checkout-api -n shop
+      dry-run: read-only, would run automatically
+
+[2] Read recent logs.
+    $ kubectl logs deploy/checkout-api -n shop --tail=20
+      dry-run: read-only, would run automatically
+
+[3] Restart it.
+    $ kubectl rollout restart deploy/checkout-api -n shop
+      dry-run: mutating, needs approval (kubectl rollout restart is not a read-only subcommand)
+
+Result: dry-run. 0 command(s) executed, 1 step(s) need approval.
+```
+
+- Values are substituted into the command text **before** classification, so the classifier, the audit log and the approval always see the exact command that would run. An approval is bound to that text, so approving step 3 for `checkout-api` does not approve it for another deployment (pass the same `--param` flags to `approve`).
+- Only plain tokens are accepted as values: letters, digits and `. _ : / @ + , = % -`. Spaces, quotes, `;`, `$`, backticks, newlines and a leading `-` are rejected, for defaults too, so a value cannot add a second command or a flag. A missing required parameter, an unsafe value or a `--param` the runbook does not use stops the tool with exit 1 before anything runs.
+- Placeholders are only recognised inside shell blocks (and step titles), so `{{ .Values.x }}` in a YAML block is left alone.
+- `parse` without `--param` shows the placeholders as written and lists the runbook's parameters. With `--json` they are under `parameters` (`null` means required).
+- MCP: `get_runbook` returns `parameters`, and `get_runbook` / `run_step` take a `params` object of strings. `run_step` fails for a missing or unsafe value, and the "ask a human to run" message includes the `--param` flags to use.
+
 ## Commands
 
 | Command | What it does |
@@ -146,7 +175,7 @@ The matching audit log entry for step 3:
 | `runbook-agent approve FILE N` | Record a one-time approval of step `N` for the MCP server (prompts for `yes`; `--yes` skips the prompt). |
 | `runbook-agent serve DIR [--execute]` | Serve the `*.md` runbooks in `DIR` as an MCP server over stdio. |
 
-`parse`, `run` and `serve` also take `--rules FILE` to load [extra allowlist rules](#custom-allowlist-rules).
+`parse`, `run` and `approve` also take `--param NAME=VALUE` to fill in [runbook parameters](#parameters). `parse`, `run` and `serve` also take `--rules FILE` to load [extra allowlist rules](#custom-allowlist-rules).
 
 Other options: `--log PATH` (audit log; defaults to `runbook-audit.jsonl` when `--execute` is given, no log is written for a dry run unless you ask), `--timeout SECONDS` per command (default 30), `--approver NAME` (recorded in the log, defaults to the current user), `--state-dir DIR` (where approvals are stored, default `.runbook-agent`).
 
@@ -271,7 +300,7 @@ To register it with an MCP client, point the client at the command `runbook-agen
 - [x] MCP server so any agent client can use it (stdio transport, tools only)
 - [x] User-defined allowlist rules from a JSON config file (`--rules`)
 - [x] Redaction of secrets in captured output (pattern based, always on)
-- [ ] Variables and parameters passed into runbook steps
+- [x] Variables and parameters passed into runbook steps (`{{name}}` placeholders, `--param`)
 - [ ] HTTP transport for the MCP server
 
 ## Limitations
